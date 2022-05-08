@@ -1,0 +1,498 @@
+---
+title: "Project 2 final"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Loading and merging the data sets
+```{r}
+# Text data:
+text_data <- read.csv("Shakespeare_data.csv")
+
+# Metadata:
+meta_data <- read.csv("Shakespeare-Plays-Years-Genre-Speeches - Copy.csv")
+
+# Name and gender data: 
+name_gender_data <- read.csv("name_gender_dataset.csv")
+
+#Rename some columns so that I can merge these data sets: 
+
+#Name columns: 
+names(name_gender_data)[names(name_gender_data) == "ï..Name" ] <- "Name"
+names(text_data)[names(text_data) == "Player" ] <- "Name"
+
+#Play title columns: 
+names(meta_data)[names(meta_data) == "Play_Title" ] <- "Play"
+
+#Join text_data and meta_data: 
+text_and_meta <- merge(text_data,
+                       meta_data,
+                       by = "Play",all.x = T)
+
+# Clean name data so that each name is only attached to one gender (the name will be assigned the gender with the higher probability):
+
+
+name_data <- merge(name_gender_data, aggregate(Probability ~ Name, 
+                                          data = name_gender_data, max))
+
+# Join name data: 
+text_and_meta$Name <- tolower(text_and_meta$Name)
+name_data$Name <- tolower(name_data$Name)
+
+merged_data <- merge(text_and_meta,
+                     name_data,
+                     by = "Name",all.x=T)
+
+```
+
+Feature engineering
+```{r}
+# Ratio of lines spoken by male to female characters in each play: 
+
+gendered_data <- merged_data[is.na(merged_data$Gender) == F,]
+
+gender_ratios <- c()
+
+for(i in seq_along(unique(gendered_data$Play))){
+  play <- unique(gendered_data$Play)[i]
+  play_data <- gendered_data[gendered_data$Play == play,]
+  male_line_count <- nrow(play_data[play_data$Gender == "M",])
+  female_line_count <- nrow(play_data[play_data$Gender == "F",])
+  gender_ratio <- male_line_count / female_line_count
+  gender_ratios <- c(gender_ratios, gender_ratio)
+}
+
+play_names <- as.data.frame(unique(gendered_data$Play))
+gender_ratios_df <- cbind(play_names,as.data.frame(gender_ratios))
+colnames(gender_ratios_df) <- c("Play","Gender_Ratio")
+
+merged_data <- merge(merged_data,gender_ratios_df,
+                     by = "Play",all.x = T)
+
+```
+
+Exploring and cleaning the data
+```{r}
+# Let's see if a higher ratio of male-to-female lines is correlated to a higher number of speeches and how these data points cluster by genre:
+
+plot(merged_data$Number_of_Speeches,merged_data$Gender_Ratio,
+     col = as.factor(merged_data$Genre))
+
+```
+
+Processing the data for clustering
+```{r}
+# Pre-processing merged data: 
+
+# Replace act and scene makers with blank spaces so that they are not counted as lines in the play and later lemmatized: 
+
+merged_data$PlayerLine <- gsub("(ACT )*(IX|IV|V?I{0,3})","",merged_data$PlayerLine)
+merged_data$PlayerLine <- gsub("(SCENE )*(IX|IV|V?I{0,3})","",merged_data$PlayerLine)
+
+# Make text data lowercase:
+merged_data$PlayerLine <- tolower(merged_data$PlayerLine)
+
+# Remove punctuation and numbers:
+merged_data$PlayerLine <- gsub("[[:punct:][:blank:]]+", " ", 
+                             merged_data$PlayerLine)
+merged_data$PlayerLine <- gsub('[[:digit:]]+', '', merged_data$PlayerLine)
+```
+
+General code for clustering
+```{r}
+# Put all the lines from each play into a list:
+
+lines_list <- vector(mode = "list", length = length(unique(merged_data$Play)))
+list_index <- 1
+
+for(i in seq_along(unique(merged_data$Play))){
+  play <- unique(merged_data$Play)[i]
+  play_data <- merged_data[text_data$Play == play,]
+  play_lines <- unlist(play_data$PlayerLine)
+  lines_list[[list_index]] <- play_lines
+  list_index <- list_index + 1
+}
+
+# Lemmatize the lines for each play:
+library(udpipe)
+dl <- udpipe_download_model(language="english")
+eng_model <- udpipe_load_model(file=dl$file_model)
+
+df_list <- vector(mode = "list", length = length(unique(merged_data$Play)))
+list_index <- 1
+
+for(i in seq_along(lines_list)){
+  lines <- lines_list[[i]]
+  split_line <- strsplit(lines,split=" ",perl=T)
+  udpipe_out <- udpipe_annotate(eng_model, x = unlist(split_line),
+                              tagger="default", parser="none")
+  lemm_df <- as.data.frame(udpipe_out)
+  df_list[[list_index]] <- lemm_df
+  list_index <- list_index + 1
+}
+
+# Count the occurrences of each lemmatized token within each play and create the term frequency matrix: 
+
+library(tidyr)
+
+df_list_2 <- list()
+list_index_2 <- 1
+
+for(i in seq_along(df_list)){
+  each_df <- df_list[[i]]
+  each_table <- as.data.frame(table(each_df$lemma))
+  wide_table <- pivot_wider(each_table, 
+                            names_from = Var1,
+                            values_from = Freq) 
+  df_list_2[[list_index_2]] <- wide_table
+  list_index_2 <- list_index_2 + 1
+  
+}
+
+term_freq_df <- dplyr::bind_rows(df_list_2)
+
+# Calculate the TF-IDF matrix:
+
+idf_cols <- list()
+
+for(i in seq_len(ncol(term_freq_df))){
+  word_col <- term_freq_df[,i]
+  word_count <- nrow(word_col) - length(which(is.na(word_col)))
+  idf <- log(nrow(word_col) / word_count)
+  idf_col <- as.data.frame(rep(idf,nrow(word_col)))
+  idf_cols[[i]] <- idf_col
+}
+
+idf_df <- dplyr::bind_cols(idf_cols)
+tf_idf <- term_freq_df * idf_df
+
+```
+
+Stopwords
+```{r}
+library(stopwords)
+library(readr)
+eme_stops = read_lines('eme stopwords.txt')
+stopwords_list <- c(stopwords::stopwords("en", source = "snowball"),
+                    eme_stops,"enter","exit",unique(merged_data$Name))
+
+mtfidf_vals <- c()
+
+for(i in seq_along(tf_idf)){
+  token_col <- tf_idf[,i]
+  mtfidf <- max(token_col,na.rm = T)
+  mtfidf_vals <- c(mtfidf_vals,mtfidf)
+}
+
+names(mtfidf_vals) <- names(tf_idf)
+
+top_indices <- head(order(mtfidf_vals,decreasing = T),5000)
+top_tokens <- mtfidf_vals[top_indices]
+
+top_df <- tf_idf[names(tf_idf) %in% names(top_tokens)]
+
+tokens <- top_df[, !(colnames(top_df) %in% stopwords_list)]
+
+# Process df for use in clustering (replace NAs):
+
+for(i in seq_along(tokens)){
+  token_col <- tokens[,i]
+  tokens[,i][is.na(tokens[,i])] <- 0
+}
+
+```
+
+K-means
+```{r}
+# Find the appropriate k value
+
+ratios <- c()
+for(i in 2:20){
+  km_out <- kmeans(tokens,i)
+  ratio <- km_out$betweenss / km_out$tot.withinss
+  ratios <- c(ratios, ratio)
+}
+
+#plot(x = 2:20, y = ratios,
+    # xlab = "number of clusters")
+
+k <- 4
+km_out <- kmeans(tokens,k)
+
+table(km_out$cluster)
+
+
+```
+Hierarchical clustering
+
+```{r}
+
+# ward.D:
+d <- dist(tokens)
+hclus_out <- hclust(d, "ward.D")
+plot(hclus_out)
+
+h_clust <- cutree(hclus_out, k = 4)
+
+for (i in 1:4) {
+    mc_tfidf <- apply(tokens[h_clust == i,], 2, max)
+    top_words <- tail(sort(mc_tfidf), 25)
+    print(paste("Top words in cluster", i))
+    print(names(top_words))    
+}
+
+```
+
+Gender clustering
+```{r}
+# Splitting plays by gender ratio: 
+
+gender_ratio_data <- merged_data[order(merged_data$Gender_Ratio),]
+midpoint <- nrow(gender_ratio_data) / 2
+
+low_ratio <- gender_ratio_data[1:midpoint,]
+high_ratio <- gender_ratio_data[midpoint:nrow(gender_ratio_data),]
+```
+
+
+```{r}
+# Clustering low ratio:
+
+# Put all the lines from each play into a list:
+
+lines_list <- vector(mode = "list", length = length(unique(low_ratio$Play)))
+list_index <- 1
+
+for(i in seq_along(unique(low_ratio$Play))){
+  play <- unique(low_ratio$Play)[i]
+  play_data <- low_ratio[low_ratio$Play == play,]
+  play_lines <- unlist(play_data$PlayerLine)
+  lines_list[[list_index]] <- play_lines
+  list_index <- list_index + 1
+}
+
+# Lemmatize the lines for each play:
+library(udpipe)
+dl <- udpipe_download_model(language="english")
+eng_model <- udpipe_load_model(file=dl$file_model)
+
+df_list <- vector(mode = "list", length = length(unique(low_ratio$Play)))
+list_index <- 1
+
+for(i in seq_along(lines_list)){
+  lines <- lines_list[[i]]
+  split_line <- strsplit(lines,split=" ",perl=T)
+  udpipe_out <- udpipe_annotate(eng_model, x = unlist(split_line),
+                              tagger="default", parser="none")
+  lemm_df <- as.data.frame(udpipe_out)
+  df_list[[list_index]] <- lemm_df
+  list_index <- list_index + 1
+}
+
+# Count the occurrences of each lemmatized token within each play and create the term frequency matrix: 
+
+library(tidyr)
+
+df_list_2 <- list()
+list_index_2 <- 1
+
+for(i in seq_along(df_list)){
+  each_df <- df_list[[i]]
+  each_table <- as.data.frame(table(each_df$lemma))
+  wide_table <- pivot_wider(each_table, 
+                            names_from = Var1,
+                            values_from = Freq) 
+  df_list_2[[list_index_2]] <- wide_table
+  list_index_2 <- list_index_2 + 1
+  
+}
+
+term_freq_df <- dplyr::bind_rows(df_list_2)
+
+# Calculate the TF-IDF matrix:
+
+idf_cols <- list()
+
+for(i in seq_len(ncol(term_freq_df))){
+  word_col <- term_freq_df[,i]
+  word_count <- nrow(word_col) - length(which(is.na(word_col)))
+  idf <- log(nrow(word_col) / word_count)
+  idf_col <- as.data.frame(rep(idf,nrow(word_col)))
+  idf_cols[[i]] <- idf_col
+}
+
+idf_df <- dplyr::bind_cols(idf_cols)
+tf_idf <- term_freq_df * idf_df
+
+#Stopwords
+
+library(stopwords)
+library(readr)
+
+eme_stops = read_lines('eme stopwords.txt')
+stopwords_list <- c(stopwords::stopwords("en", source = "snowball"),
+                    eme_stops,"enter","exit",unique(merged_data$Name))
+
+mtfidf_vals <- c()
+
+for(i in seq_along(tf_idf)){
+  token_col <- tf_idf[,i]
+  mtfidf <- max(token_col,na.rm = T)
+  mtfidf_vals <- c(mtfidf_vals,mtfidf)
+}
+
+names(mtfidf_vals) <- names(tf_idf)
+
+top_indices <- head(order(mtfidf_vals,decreasing = T),5000)
+top_tokens <- mtfidf_vals[top_indices]
+
+top_df <- tf_idf[names(tf_idf) %in% names(top_tokens)]
+
+tokens <- top_df[, !(colnames(top_df) %in% stopwords_list)]
+
+# Process df for use in clustering (replace NAs):
+
+for(i in seq_along(tokens)){
+  token_col <- tokens[,i]
+  tokens[,i][is.na(tokens[,i])] <- 0
+}
+
+# ward.D:
+d <- dist(tokens)
+hclus_out <- hclust(d, "ward.D")
+plot(hclus_out)
+
+h_clust <- cutree(hclus_out, k = 3)
+
+for (i in 1:3) {
+    mc_tfidf <- apply(tokens[h_clust == i,], 2, max)
+    top_words <- tail(sort(mc_tfidf), 25)
+    print(paste("Top words in cluster", i))
+    print(names(top_words))    
+}
+
+```
+
+
+```{r}
+# Clustering high ratio:
+
+# Put all the lines from each play into a list:
+
+lines_list <- vector(mode = "list", length = length(unique(high_ratio$Play)))
+list_index <- 1
+
+for(i in seq_along(unique(high_ratio$Play))){
+  play <- unique(high_ratio$Play)[i]
+  play_data <- high_ratio[high_ratio$Play == play,]
+  play_lines <- unlist(play_data$PlayerLine)
+  lines_list[[list_index]] <- play_lines
+  list_index <- list_index + 1
+}
+
+# Lemmatize the lines for each play:
+library(udpipe)
+dl <- udpipe_download_model(language="english")
+eng_model <- udpipe_load_model(file=dl$file_model)
+
+df_list <- vector(mode = "list", length = length(unique(high_ratio$Play)))
+list_index <- 1
+
+for(i in seq_along(lines_list)){
+  lines <- lines_list[[i]]
+  split_line <- strsplit(lines,split=" ",perl=T)
+  udpipe_out <- udpipe_annotate(eng_model, x = unlist(split_line),
+                              tagger="default", parser="none")
+  lemm_df <- as.data.frame(udpipe_out)
+  df_list[[list_index]] <- lemm_df
+  list_index <- list_index + 1
+}
+
+# Count the occurrences of each lemmatized token within each play and create the term frequency matrix: 
+
+library(tidyr)
+
+df_list_2 <- list()
+list_index_2 <- 1
+
+for(i in seq_along(df_list)){
+  each_df <- df_list[[i]]
+  each_table <- as.data.frame(table(each_df$lemma))
+  wide_table <- pivot_wider(each_table, 
+                            names_from = Var1,
+                            values_from = Freq) 
+  df_list_2[[list_index_2]] <- wide_table
+  list_index_2 <- list_index_2 + 1
+  
+}
+
+term_freq_df <- dplyr::bind_rows(df_list_2)
+
+# Calculate the TF-IDF matrix:
+
+idf_cols <- list()
+
+for(i in seq_len(ncol(term_freq_df))){
+  word_col <- term_freq_df[,i]
+  word_count <- nrow(word_col) - length(which(is.na(word_col)))
+  idf <- log(nrow(word_col) / word_count)
+  idf_col <- as.data.frame(rep(idf,nrow(word_col)))
+  idf_cols[[i]] <- idf_col
+}
+
+idf_df <- dplyr::bind_cols(idf_cols)
+tf_idf <- term_freq_df * idf_df
+
+#Stopwords
+
+library(stopwords)
+library(readr)
+
+eme_stops = read_lines('eme stopwords.txt')
+stopwords_list <- c(stopwords::stopwords("en", source = "snowball"),
+                    eme_stops,"enter","exit",unique(merged_data$Name))
+
+mtfidf_vals <- c()
+
+for(i in seq_along(tf_idf)){
+  token_col <- tf_idf[,i]
+  mtfidf <- max(token_col,na.rm = T)
+  mtfidf_vals <- c(mtfidf_vals,mtfidf)
+}
+
+names(mtfidf_vals) <- names(tf_idf)
+
+top_indices <- head(order(mtfidf_vals,decreasing = T),5000)
+top_tokens <- mtfidf_vals[top_indices]
+
+top_df <- tf_idf[names(tf_idf) %in% names(top_tokens)]
+
+tokens <- top_df[, !(colnames(top_df) %in% stopwords_list)]
+
+# Process df for use in clustering (replace NAs):
+
+for(i in seq_along(tokens)){
+  token_col <- tokens[,i]
+  tokens[,i][is.na(tokens[,i])] <- 0
+}
+
+# ward.D:
+d <- dist(tokens)
+hclus_out <- hclust(d, "ward.D")
+plot(hclus_out)
+
+h_clust <- cutree(hclus_out, k = 3)
+
+for (i in 1:3) {
+    mc_tfidf <- apply(tokens[h_clust == i,], 2, max)
+    top_words <- tail(sort(mc_tfidf), 25)
+    print(paste("Top words in cluster", i))
+    print(names(top_words))    
+}
+
+```
+
+
